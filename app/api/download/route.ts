@@ -1,30 +1,58 @@
 import { NextResponse } from 'next/server';
+import crypto from 'crypto';
 
-export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
-  const movieId = searchParams.get('id');
+// Global scope initialization to prevent compilation errors
+declare global {
+    var activeTokens: Map<string, { movieId: string; expiresAt: number }>;
+    var rateLimitMap: Map<string, { count: number; resetTime: number }>;
+}
 
-  // यहाँ हम डमी लिंक्स रख रहे हैं, बाद में इसे डेटाबेस (MongoDB) से कनेक्ट करेंगे
-  const movieLinks: { [key: string]: string } = {
-    '1': 'https://w3schools.com', // डमी टेस्ट वीडियो लिंक 1
-    '2': 'https://w3schools.com',   // डमी टेस्ट वीडियो लिंक 2
-    '3': 'https://w3schools.com', // डमी टेस्ट वीडियो लिंक 3
-  };
+if (!global.activeTokens) global.activeTokens = new Map();
+if (!global.rateLimitMap) global.rateLimitMap = new Map();
 
-  const actualStorageUrl = movieLinks[movieId || ''];
+export async function POST(request: Request) {
+    try {
+        const body = await request.json();
+        const { movieId } = body;
+        
+        // 1. Host Key Validation Check
+        const hostKey = request.headers.get('x-host-key');
+        if (!hostKey || hostKey !== 'streamflix-host-node-2026') {
+            return NextResponse.json({ error: 'Unauthorized host key allocation.' }, { status: 403 });
+        }
 
-  if (!actualStorageUrl) {
-    return NextResponse.json({ error: 'Movie file not found!' }, { status: 404 });
-  }
+        // 2. Strict Rate Limiting: Max 2 requests per minute
+        const currentTime = Date.now();
+        const limitWindow = 60 * 1000;
+        const userLimitData = global.rateLimitMap.get(hostKey) || { count: 0, resetTime: currentTime + limitWindow };
 
-  // Content-Disposition header ब्राउज़र को मजबूर करता है कि वो वीडियो प्ले करने के बजाय 
-  // सीधे सिंगल-क्लिक में डाउनलोड शुरू कर दे।
-  return new NextResponse(null, {
-    status: 302,
-    headers: {
-      'Location': actualStorageUrl,
-      'Content-Disposition': `attachment; filename="Streamflix-Movie-${movieId}.mp4"`,
-      'Content-Type': 'video/mp4',
-    },
-  });
+        if (currentTime > userLimitData.resetTime) {
+            userLimitData.count = 1;
+            userLimitData.resetTime = currentTime + limitWindow;
+        } else {
+            userLimitData.count++;
+        }
+        global.rateLimitMap.set(hostKey, userLimitData);
+
+        if (userLimitData.count > 2) {
+            return NextResponse.json(
+                { error: 'Too many requests. Limit exceeded (Max 2 per minute).' }, 
+                { status: 429 }
+            );
+        }
+
+        // 3. Dynamic URL Token Generation
+        const streamToken = crypto.randomBytes(16).toString('hex');
+        const expiresAt = currentTime + (2 * 60 * 60 * 1000); // 2 Hours Valid
+
+        global.activeTokens.set(streamToken, { movieId, expiresAt });
+
+        const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || 'https://yourdomain.com';
+        const dynamicStreamUrl = `${baseUrl}/api/stream/${streamToken}.m3u8`;
+
+        return NextResponse.json({ streamUrl: dynamicStreamUrl });
+
+    } catch (error) {
+        return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
+    }
 }
